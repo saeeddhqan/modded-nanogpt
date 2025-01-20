@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import load_inline
+from torch import Tensor
 
 cuda_source = (Path(__file__).parent / 'csrc' / 'warp.cuh').read_text()
 
@@ -25,12 +26,19 @@ module = load_inline(
         "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
     ]
 )
-warpscan_forward = module.warpscan_forward
 
-def scan_forward(gates, tokens, reverse=False):
+@torch.library.custom_op("mylib::warpscan_forward", mutates_args=(), device_types="cuda")
+def warpscan_forward(gates: Tensor, tokens: Tensor, reverse: bool = False) -> Tensor:
     output = torch.zeros_like(tokens)
-    warpscan_forward(gates, tokens, output, reverse)
+    module.warpscan_forward(gates, tokens, output, reverse)
     return output
+
+def warpscan_forwardfake(gates: Tensor, tokens: Tensor, reverse: bool = False):
+    # torch._check(gates.device == tokens.device)
+    # torch._check(gates.dtype == tokens.dtype)
+    return torch.empty_like(gates)
+
+warpscan_forward.register_fake(warpscan_forwardfake)
 
 
 class Scan(torch.autograd.Function):
@@ -41,7 +49,7 @@ class Scan(torch.autograd.Function):
         assert gates.is_contiguous()
         assert tokens.is_contiguous()
 
-        states = scan_forward(gates, tokens)
+        states = warpscan_forward(gates, tokens)
         ctx.save_for_backward(states, gates)
         return states
 
@@ -57,7 +65,7 @@ class Scan(torch.autograd.Function):
         assert gates.is_contiguous()
 
         padded_shifted_gates = torch.cat([gates, torch.ones_like(gates[:, :, :1])], dim=-1)[:, :, 1:].contiguous()
-        d_states = scan_forward(padded_shifted_gates, grad_output, reverse=True)
+        d_states = warpscan_forward(padded_shifted_gates, grad_output, reverse=True)
 
         padded_outputs = torch.cat([torch.zeros_like(states[:, :, :1]), states], dim=-1)[:, :, :-1]
         d_gates = padded_outputs * d_states
@@ -82,3 +90,17 @@ def scan(gates, tokens):
         (torch.Tensor): shape (B, C, T)
     """
     return Scan.apply(gates, tokens)
+
+
+if __name__ == "__main__":
+    # Example to test if it works with torch.compile
+    @torch.compile()
+    def test_scan(gates, tokens):
+        return scan(gates, tokens)
+
+    # Test the functionality
+    gates = torch.randn(2, 3, 64).cuda()
+    tokens = torch.randn(2, 3, 64).cuda()
+
+    output = test_scan(gates, tokens)
+    print(output)
