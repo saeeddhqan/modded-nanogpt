@@ -1,4 +1,8 @@
 import os
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6 8.9'
+import torch
+from pscan.warp import scan
+
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -7,16 +11,16 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from pscan.warp import scan
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from pscan.warp import scan
+
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 
 # -----------------------------------------------------------------------------
