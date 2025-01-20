@@ -31,6 +31,7 @@ git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogp
 pip install -r requirements.txt
 pip install --pre torch==2.7.0.dev20250110+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training tokens to save time
+python3 -m pip install --upgrade 'optree>=0.13.0'
 ./run.sh
 ```
 

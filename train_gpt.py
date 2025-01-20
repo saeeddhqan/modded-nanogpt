@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from pscan.warp import scan
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -254,38 +255,179 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int):
-        super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
-        self.c_proj = CastedLinear(dim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12
+# class CausalSelfAttention(nn.Module):
+#     def __init__(self, dim: int, num_heads: int, layer_idx: int):
+#         super().__init__()
+#         assert dim % num_heads == 0
+#         self.num_heads = num_heads
+#         std = 0.5 * (dim ** -0.5)
+#         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+#         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+#         # https://x.com/hi_tysam/status/1879699187107033311
+#         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
+#         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+#         self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+#         self.c_proj = CastedLinear(dim, dim)
+#         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+#         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+#         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+#         self.attn_scale = 0.12
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3*self.num_heads, -1).chunk(3, dim=-2)
-        if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
-        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return y
+#     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+#         B, T = x.size(0), x.size(1) # batch size, sequence length
+#         assert B == 1, "Must use batch size = 1 for FlexAttention"
+#         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3*self.num_heads, -1).chunk(3, dim=-2)
+#         if ve is not None:
+#             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+#         else: # skip mid-layers token value embeddings by @YouJiacheng
+#             v = self.lambdas[0] * v
+#         q, k = norm(q), norm(k) # QK norm @Grad62304977
+#         q, k = self.rotary(q), self.rotary(k)
+#         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+#         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+#         y = self.c_proj(y)
+#         return y
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self,
+        dim: int,
+        num_heads: int,
+        layer_idx: int,
+        expansion_factor: int = 1.5,
+        kernel_size: int = 4,
+        num_slots: int = 2,
+        slot_dim: int = 128,
+        block_size: int = 1024,
+        lsg: bool = True,
+        mem_enhance: bool = True,
+    ):
+        super().__init__()
+        hidden = int(dim * expansion_factor)
+        self.input = nn.Linear(dim, 2 * hidden, bias=False)
+        self.conv = nn.Conv1d(in_channels=hidden, out_channels=hidden, bias=True,
+                              kernel_size=kernel_size, groups=hidden, padding=kernel_size - 1)
+        self.gates = nn.Linear(hidden, 2 * hidden, bias=True)
+        self.lsg = lsg # locality sensitive gating
+        if lsg:
+            bases = []
+            for x in range(num_slots):
+                bases.append(torch.linspace(-4.323, -9, hidden))
+            self.forget_base = nn.Parameter(torch.cat(bases).view(1, num_slots, 1, -1))
+        else:
+            self.forget_base = nn.Parameter(torch.linspace(-4.323, -9, hidden))
+        self.output = nn.Linear(hidden, dim, bias=False)
+        self.mem_enhance = mem_enhance
+        if mem_enhance:
+            # Memory slots components
+            self.memory_slots = nn.Parameter(torch.randn(num_slots, slot_dim))
+            # Writing components
+            self.write_query = nn.Linear(slot_dim, slot_dim, bias=False)
+            self.write_key = nn.Linear(hidden, slot_dim, bias=False)
+            self.write_value = nn.Linear(hidden, slot_dim, bias=False)
+            self.write_gate = nn.Linear(hidden, 1, bias=False)
+            
+            # Reading components
+            self.read_query = nn.Linear(hidden, slot_dim, bias=False)
+            self.read_key = nn.Linear(slot_dim, slot_dim, bias=False)
+            self.read_value = nn.Linear(slot_dim, hidden, bias=False)
+        self.segment_length = block_size // num_slots
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        with torch.no_grad():
+            self.input.weight.normal_(std=dim ** -0.5)
+            self.gates.weight.normal_(std=hidden ** -0.5)
+            self.output.weight.normal_(std=hidden ** -0.5)
+            if mem_enhance:
+                nn.init.normal_(self.write_query.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.write_key.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.write_value.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.write_gate.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.read_query.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.read_key.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.read_value.weight, mean=0.0, std=0.02)
+                nn.init.normal_(self.memory_slots, std=0.02)
+
+    def write_memory(self, x: Tensor) -> Tensor:
+        B, T, _ = x.shape
+        segment_length = T // self.num_slots
+        # Reshape x into segments
+        x_segments = x.view(B, self.num_slots, segment_length, -1)
+        q = self.write_query(self.memory_slots)  # [num_slots, slot_dim]
+        k = self.write_key(x_segments)           # [B, num_slots, segment_length, slot_dim]
+        v = self.write_value(x_segments)         # [B, num_slots, segment_length, slot_dim]
+        # Expand q to match B dimension
+        q = q.unsqueeze(0).expand(B, -1, -1)  # [B, num_slots, slot_dim]
+        k = k.view(B, self.num_slots, segment_length, -1)
+        v = v.view(B, self.num_slots, segment_length, -1)
+        # Each slot attends only to its corresponding segment
+        memory = []
+        for i in range(self.num_slots):
+            qi = q[:, i:i+1]  # [B, 1, slot_dim]
+            ki = k[:, i]      # [B, segment_length, slot_dim]
+            vi = v[:, i]      # [B, segment_length, slot_dim]
+            qk = torch.matmul(qi, ki.transpose(-2, -1)) / math.sqrt(self.slot_dim)
+            attn = F.softmax(qk, dim=-1)
+            slot_content = torch.matmul(attn, vi)  # [B, 1, slot_dim]
+            memory.append(slot_content)
+        memory = torch.cat(memory, dim=1)  # [B, num_slots, slot_dim]
+
+        return memory
+
+    def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
+        B, T, _ = x.shape
+        segment_length = T // self.num_slots
+        q = self.read_query(x)      # [B, T, slot_dim]
+        k = self.read_key(memory)   # [B, num_slots, slot_dim]
+        v = self.read_value(memory) # [B, num_slots, dim]
+        qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.slot_dim)
+        # Create causal mask for slots
+        # Token i can only attend to slots j where j <= i//segment_length
+        causal_mask = torch.zeros(T, self.num_slots, device=x.device)
+        for i in range(T):
+            current_segment = i // segment_length
+            causal_mask[i, :current_segment + 1] = 1
+        # Apply causal mask
+        qk = qk.masked_fill(causal_mask.unsqueeze(0) == 0, float('-inf'))
+        attn = F.softmax(qk, dim=-1)
+        output = torch.matmul(attn, v)  # [B, T, dim]
+        output = F.sigmoid(self.write_gate(x)) * output
+        return output
+
+    def forward(self, x: Tensor, ve: Tensor, block_mask) -> Tensor:
+        if self.lsg:
+            return self.lsg_forward(x)
+        gate, x = self.input(x).chunk(2, dim=-1)
+        x = self.conv(x.mT)[..., :x.size(1)].mT
+        forget, inp = self.gates(x).chunk(2, dim=-1)
+        alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
+        beta = (1 - alpha ** 2 + 1e-6).sqrt()
+        x = beta * inp.sigmoid() * x
+        h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
+        x = gate * gate.sigmoid() * x # silu*
+        if self.mem_enhance:
+            mem = self.write_memory(x)
+            x = x + self.read_memory(x, mem)
+        x = self.output(F.gelu(x) * h)
+        return x
+
+    def lsg_forward(self, x: Tensor) -> Tensor:
+        gate, x = self.input(x).chunk(2, dim=-1)
+        x = self.conv(x.mT)[..., :x.size(1)].mT
+        forget, inp = self.gates(x).chunk(2, dim=-1)
+        B, T, C = forget.size()
+        forget = forget.view(B, self.num_slots, self.segment_length, C)
+
+        alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
+        alpha = alpha.view(B, T, C).contiguous()
+        beta = (1 - alpha ** 2 + 1e-6).sqrt()
+        x = beta * inp.sigmoid() * x
+        h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
+        x = gate * gate.sigmoid() * x # silu*
+        if self.mem_enhance:
+            mem = self.write_memory(x)
+            x = x + self.read_memory(x, mem)
+        x = self.output(F.gelu(x) * h)
+        return x
 
 class MLP(nn.Module):
     def __init__(self, dim):
@@ -459,7 +601,8 @@ class Hyperparameters:
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    batch_size = 8*64*1024 # batch size in tokens
+    # batch_size = 8*64*1024 # batch size in tokens
+    batch_size = 32*1024 # batch size in tokens
     num_iterations = 1393 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
@@ -508,7 +651,7 @@ print0("="*100)
 # load data
 train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-model = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768).cuda()
+model = GPT(vocab_size=50257, num_layers=12, num_heads=2, model_dim=128).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -548,6 +691,7 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
+    print(step)
     last_step = (step == train_steps)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
