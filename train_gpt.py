@@ -18,6 +18,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from pscan.warp import scan
+import math
 import random
 def set_seed(seed: int):
     random.seed(seed)
@@ -26,7 +27,7 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 set_seed(1234)
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-use_lsgm = False
+use_lsgm = True
 
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
@@ -86,8 +87,8 @@ class CausalSelfAttention(nn.Module):
 
 
     def forward(self, x: Tensor) -> Tensor:
-        B, T, _ = x.size()
-        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1))
+        B, T, C = x.size()
+        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x))
         q, k, v = qkv.view(B, T, 3 * self.num_heads, -1).chunk(3, dim=-2)
         q = self.rotary(q)
         k = self.rotary(k)
@@ -95,21 +96,19 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1 if self.training else 0.0, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.dim)  # => (B, T, dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
 
 class LSGM(nn.Module):
     def __init__(self,
         dim: int,
-        num_heads: int,
-        layer_idx: int,
         expansion_factor: int = 1.5,
         kernel_size: int = 4,
-        num_slots: int = 2,
-        slot_dim: int = 128,
-        block_size: int = 1024,
-        lsg: bool = True,
+        num_slots: int = 16,
+        slot_dim: int = 384,
+        block_size: int = 65536,
+        lsg: bool = False,
         mem_enhance: bool = True,
     ):
         super().__init__()
@@ -157,46 +156,52 @@ class LSGM(nn.Module):
     def write_memory(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
         segment_length = T // self.num_slots
+
         # Reshape x into segments
         x_segments = x.view(B, self.num_slots, segment_length, -1)
-        q = self.write_query(self.memory_slots)  # [num_slots, slot_dim]
-        k = self.write_key(x_segments)           # [B, num_slots, segment_length, slot_dim]
-        v = self.write_value(x_segments)         # [B, num_slots, segment_length, slot_dim]
+
+        # Query, Key, and Value
+        q = self.write_query(self.memory_slots.to(x.dtype))  # [num_slots, slot_dim]
+        k = self.write_key(x_segments)  # [B, num_slots, segment_length, slot_dim]
+        v = self.write_value(x_segments)  # [B, num_slots, segment_length, slot_dim]
+
         # Expand q to match B dimension
         q = q.unsqueeze(0).expand(B, -1, -1)  # [B, num_slots, slot_dim]
-        k = k.view(B, self.num_slots, segment_length, -1)
-        v = v.view(B, self.num_slots, segment_length, -1)
+
         # Each slot attends only to its corresponding segment
-        memory = []
-        for i in range(self.num_slots):
-            qi = q[:, i:i+1]  # [B, 1, slot_dim]
-            ki = k[:, i]      # [B, segment_length, slot_dim]
-            vi = v[:, i]      # [B, segment_length, slot_dim]
-            qk = torch.matmul(qi, ki.transpose(-2, -1)) / math.sqrt(self.slot_dim)
-            attn = F.softmax(qk, dim=-1)
-            slot_content = torch.matmul(attn, vi)  # [B, 1, slot_dim]
-            memory.append(slot_content)
-        memory = torch.cat(memory, dim=1)  # [B, num_slots, slot_dim]
+        # Reshape k and v to match the B dimension
+        k = k.view(B, self.num_slots, segment_length, -1)  # [B, num_slots, segment_length, slot_dim]
+        v = v.view(B, self.num_slots, segment_length, -1)  # [B, num_slots, segment_length, slot_dim]
+
+        # Compute attention for each slot and segment
+        qk = torch.matmul(q.unsqueeze(2), k.transpose(-2, -1)) / math.sqrt(self.slot_dim)  # [B, num_slots, 1, segment_length]
+        attn = F.softmax(qk, dim=-1)  # [B, num_slots, 1, segment_length]
+
+        # Memory computation (without loop)
+        memory = torch.matmul(attn, v)  # [B, num_slots, 1, slot_dim]
+        memory = memory.squeeze(2)  # [B, num_slots, slot_dim]
 
         return memory
 
     def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
         B, T, _ = x.shape
         segment_length = T // self.num_slots
+        # Query, Key, and Value
         q = self.read_query(x)      # [B, T, slot_dim]
         k = self.read_key(memory)   # [B, num_slots, slot_dim]
         v = self.read_value(memory) # [B, num_slots, dim]
-        qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.slot_dim)
+        # Compute attention scores
+        qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.slot_dim)  # [B, T, num_slots]
         # Create causal mask for slots
-        # Token i can only attend to slots j where j <= i//segment_length
-        causal_mask = torch.zeros(T, self.num_slots, device=x.device)
-        for i in range(T):
-            current_segment = i // segment_length
-            causal_mask[i, :current_segment + 1] = 1
-        # Apply causal mask
-        qk = qk.masked_fill(causal_mask.unsqueeze(0) == 0, float('-inf'))
-        attn = F.softmax(qk, dim=-1)
+        # Each token i can only attend to slots j where j <= i//segment_length
+        mask = torch.arange(T, device=x.device).unsqueeze(1) // segment_length  # [T, 1] -> Which segment the token belongs to
+        mask = mask <= torch.arange(self.num_slots, device=x.device)  # [T, num_slots] -> Causal mask for each slot
+        # Apply causal mask: Replace where mask is 0 with -inf to prevent attention
+        qk = qk.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))  # [B, T, num_slots]
+        # Attention and output
+        attn = F.softmax(qk, dim=-1)  # [B, T, num_slots]
         output = torch.matmul(attn, v)  # [B, T, dim]
+        # Apply gate
         output = F.sigmoid(self.write_gate(x)) * output
         return output
 
@@ -206,16 +211,17 @@ class LSGM(nn.Module):
         gate, x = self.input(x).chunk(2, dim=-1)
         x = self.conv(x.mT)[..., :x.size(1)].mT
         forget, inp = self.gates(x).chunk(2, dim=-1)
-        alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
-        beta = (1 - alpha ** 2 + 1e-6).sqrt()
-        x = beta * inp.sigmoid() * x
+        alpha = (-8 * F.softplus(self.forget_base.to(x.dtype)) * forget.sigmoid()).exp()
+        x = (1 - alpha ** 2 + 1e-6).sqrt() * inp.sigmoid() * x
         h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-        x = gate * gate.sigmoid() * x
-        if self.mem_enhance:
+
+        if self.mem_enhance:  # this is a divergence from hawk
+            x = gate * gate.sigmoid() * x
             mem = self.write_memory(x)
-            x = x + self.read_memory(x, mem)
-        x = self.output(F.gelu(x) * h)
-        return x
+            x = self.read_memory(F.gelu(x) * h, mem)
+            return self.output(x)
+
+        return self.output(F.gelu(gate) * h)
 
     def lsg_forward(self, x: Tensor) -> Tensor:
         gate, x = self.input(x).chunk(2, dim=-1)
@@ -224,17 +230,19 @@ class LSGM(nn.Module):
         B, T, C = forget.size()
         forget = forget.view(B, self.num_slots, self.segment_length, C)
 
-        alpha = (-8 * F.softplus(self.forget_base) * forget.sigmoid()).exp()
+        alpha = (-8 * F.softplus(self.forget_base.to(x.dtype)) * forget.sigmoid()).exp()
         alpha = alpha.view(B, T, C).contiguous()
         beta = (1 - alpha ** 2 + 1e-6).sqrt()
         x = beta * inp.sigmoid() * x
         h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-        x = gate * gate.sigmoid() * x
-        if self.mem_enhance:
+        if self.mem_enhance:  # this is a divergence from hawk
+            x = gate * gate.sigmoid() * x
             mem = self.write_memory(x)
             x = x + self.read_memory(x, mem)
-        x = self.output(F.gelu(x) * h)
+            return self.output(F.gelu(x) * h)
+        x = self.output(F.gelu(gate) * h)
         return x
+
 
 class GatedMLP(nn.Module):
     def __init__(self, dim: int = 1024, expansion_factor: int = 2):
@@ -272,7 +280,7 @@ class Block(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(dim, num_heads) if use_lsgm is False else LSGM(dim)
-        self.mlp = MLP(dim) if use_lsgm is False else GatedMLP(dim)
+        self.mlp = MLP(dim) #if use_lsgm is False else GatedMLP(dim)
 
     def forward(self, x):
         x = x + self.attn(norm(x))
@@ -289,6 +297,14 @@ class Model(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
         self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
+        nparams = self.num_params() / 1e6
+        print0("Number of parameters: %.3fM" % (nparams,))
+        print("Number of parameters: %.3fM" % (nparams,))
+
+    def num_params(self) -> int:
+        n_params = sum(p.numel() for p in self.parameters())
+        n_params -= self.embed.weight.numel()
+        return n_params
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         x = self.embed(input_seq)[None]
@@ -340,7 +356,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 4 * 1024
+    seq_len = 16 * 1024
     save_checkpoint = False
 args = Hyperparameters()
 
@@ -383,7 +399,7 @@ print0("="*100)
 # load data
 train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-model = Model(vocab_size=50257, num_layers=12, num_heads=2, model_dim=128).cuda()
+model = Model(vocab_size=50257, num_layers=8, num_heads=2, model_dim=128).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -402,7 +418,7 @@ def get_lr(it: int):
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
 
-model: nn.Module = torch.compile(model)
+# model: nn.Module = torch.compile(model)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -410,7 +426,6 @@ t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
-    print(step)
     last_step = (step == train_steps)
 
     if step == 10:
@@ -428,16 +443,19 @@ for step in range(train_steps + 1):
         model.eval()
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
-        val_steps = args.val_tokens // val_bs
+        val_steps = 50 # args.val_tokens // val_bs
         val_loader = distributed_data_generator(args.val_files, val_bs, rank, world_size)
         val_loss = 0
+
         with torch.no_grad():
-            for _ in range(val_steps):
+            for s in range(val_steps):
+                print(s, '/', val_steps, end='\r')
                 x, y = next(val_loader)
                 val_loss += model(x, y)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -455,7 +473,8 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     inputs, targets = next(train_loader)
     for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-        model(input_seq, target_seq).backward()
+        train_loss = model(input_seq, target_seq)
+        train_loss.backward()
     for param in model.parameters():
         if param.grad is not None:
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
@@ -471,3 +490,5 @@ print0(
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
 )
 dist.destroy_process_group()
+if master_process:
+    print(run_id)
