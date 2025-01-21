@@ -18,7 +18,13 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from pscan.warp import scan
-
+import random
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+set_seed(1234)
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 use_lsgm = False
 
@@ -284,14 +290,12 @@ class Model(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
         self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor):
         x = self.embed(input_seq)[None]
         for block in self.blocks:
             x = block(x)
         x = norm(x)
         logits = self.lm_head(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        # logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
 
@@ -331,7 +335,7 @@ class Hyperparameters:
     # optimization
     # batch_size = 8*64*1024 # batch size in tokens
     batch_size = 64 * 1024 # batch size in tokens
-    num_iterations = 1001 # number of iterations to run
+    num_iterations = 1010 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -430,7 +434,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 x, y = next(val_loader)
-                val_loss += model(x, y, sw_num_blks(window_size))
+                val_loss += model(x, y)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
