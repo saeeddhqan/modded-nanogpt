@@ -105,7 +105,7 @@ class LSGM(nn.Module):
         dim: int,
         expansion_factor: int = 1.5,
         kernel_size: int = 4,
-        num_slots: int = 16,
+        num_slots: int = 32,
         slot_dim: int = 384,
         block_size: int = 65536,
         lsg: bool = False,
@@ -218,8 +218,8 @@ class LSGM(nn.Module):
         if self.mem_enhance:  # this is a divergence from hawk
             x = gate * gate.sigmoid() * x
             mem = self.write_memory(x)
-            x = self.read_memory(F.gelu(x) * h, mem)
-            return self.output(x)
+            x = x + self.read_memory(x, mem)
+            return self.output(F.gelu(x) * h)
 
         return self.output(F.gelu(gate) * h)
 
@@ -280,7 +280,7 @@ class Block(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(dim, num_heads) if use_lsgm is False else LSGM(dim)
-        self.mlp = MLP(dim) #if use_lsgm is False else GatedMLP(dim)
+        self.mlp = MLP(dim) if use_lsgm is False else GatedMLP(dim)
 
     def forward(self, x):
         x = x + self.attn(norm(x))
