@@ -65,3 +65,10 @@ def norm(x):
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+
+def nearest_power_of_two(x: int, round_up: bool = False) -> int:
+    return (
+        1 << math.floor(math.log2(x)) if not round_up else 1 << math.ceil(math.log2(x))
+    )
+

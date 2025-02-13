@@ -68,7 +68,7 @@ class memory(nn.Module):
         memory = torch.matmul(attn, v)  # [B, num_slots, 1, dim]
         memory = memory.squeeze(2)  # [B, num_slots, dim]
 
-        return memory
+        return norm(memory)
 
     def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
         B, T, _ = x.shape
@@ -95,5 +95,5 @@ class memory(nn.Module):
         h = self.gate(x)
         if self.idx == 0:
             memory = self.write_memory(x)
-        x = x + F.sigmoid(h) * self.read_memory(x, memory)
+        x = F.sigmoid(h) * self.read_memory(x, memory)
         return self.output(x), memory

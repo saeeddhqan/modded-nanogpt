@@ -29,13 +29,14 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 set_seed(1234)
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-method = 'attn'
+dtype = torch.bfloat16
+method = 'stu+gating'
 if 'stu' in method:
     stu.build_phi()
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, idx: int):
         super().__init__()
         seqlen = 16 * 1024
         if method == 'attn':
@@ -46,8 +47,8 @@ class Block(nn.Module):
             n = nearest_power_of_two(seqlen * 2 - 1, round_up=True)
             self.attn = stu.STU(
                 n_embd=dim,
-                num_eigh=24,
-                torch_dtype=torch.float32,
+                idx=idx,
+                torch_dtype=dtype,
                 phi=stu.phi,
                 n=n,
                 gating=True if 'gating' in method else False,
@@ -56,17 +57,21 @@ class Block(nn.Module):
             raise Exception("method not found")
         self.mlp = MLP(dim) if method != 'lsgm' else GatedMLP(dim)
 
-    def forward(self, x):
-        x = x + self.attn(norm(x))
+    def forward(self, x, mem):
+        if 'stu' not in method:
+            x = x + self.attn(norm(x))
+        else:
+            y, mem = self.attn(norm(x), mem)
+            x = x + y
         x = x + self.mlp(norm(x))
-        return x
+        return x, mem
 
 
 class Model(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, idx) for idx in range(num_layers)])
         self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
         nparams = self.num_params() / 1e6
         print0("Number of parameters: %.3fM" % (nparams,))
@@ -79,8 +84,9 @@ class Model(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         x = self.embed(input_seq)[None]
+        mem = None
         for block in self.blocks:
-            x = block(x)
+            x, mem = block(x, mem)
         x = norm(x)
         logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
@@ -137,7 +143,7 @@ world_size = int(os.environ["WORLD_SIZE"])
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl")
+dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
