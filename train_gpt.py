@@ -2,9 +2,10 @@ import os
 from util import *
 os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6 8.9'
 import torch
-from LSGM import LSGM
+# from LSGM import LSGM
 from attention import CausalSelfAttention
-from stu import STU, phi
+import stu
+
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -19,7 +20,6 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from pscan.warp import scan
 import math
 import random
 def set_seed(seed: int):
@@ -28,9 +28,10 @@ def set_seed(seed: int):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 set_seed(1234)
-torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 method = 'attn'
-
+if 'stu' in method:
+    stu.build_phi()
 
 
 class Block(nn.Module):
@@ -43,11 +44,11 @@ class Block(nn.Module):
             self.attn = LSGM(dim)
         elif 'stu' in method:
             n = nearest_power_of_two(seqlen * 2 - 1, round_up=True)
-            self.attn = STU(
+            self.attn = stu.STU(
                 n_embd=dim,
                 num_eigh=24,
                 torch_dtype=torch.float32,
-                phi=phi,
+                phi=stu.phi,
                 n=n,
                 gating=True if 'gating' in method else False,
             ).to(device)
@@ -136,7 +137,7 @@ world_size = int(os.environ["WORLD_SIZE"])
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+dist.init_process_group(backend="nccl")
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 

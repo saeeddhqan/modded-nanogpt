@@ -11,6 +11,7 @@ def nearest_power_of_two(x: int, round_up: bool = False) -> int:
     )
 
 
+
 class STU(nn.Module):
     def __init__(self, n_embd, num_eigh, torch_dtype, phi, n, idx, gating: bool = False) -> None:
         super(STU, self).__init__()
@@ -58,9 +59,13 @@ class STU(nn.Module):
 
 
 def get_hankel(seq_len: int) -> np.ndarray:
+    print('here')
     entries = np.arange(1, seq_len + 1, dtype=np.float64)
+    print('here')
     i_plus_j = entries[:, None] + entries[None, :]
+    print('here')
     Z = 2.0 / (i_plus_j**3 - i_plus_j)
+    print('finish')
     return Z
 
 
@@ -72,8 +77,11 @@ def get_spectral_filters(
 ) -> torch.Tensor:
     Z = get_hankel(seq_len)
     sigma, phi = np.linalg.eigh(Z)
+    print('eigh done')
     sigma, phi = sigma[-K:], phi[:, -K:]
+    print('sigma done')
     phi *= sigma ** 0.25
+    phi.save("phi.pt")
     return torch.tensor(phi, device=device, dtype=dtype)
 
 
@@ -99,8 +107,13 @@ def convolve(u: torch.Tensor, v: torch.Tensor, n: int) -> tuple[torch.Tensor, to
     return U_plus, U_minus
 
 
-phi = get_spectral_filters(16 * 1024, num_eigh=24, device='cuda', torch_dtype=torch.float32)
-
+phi = None
+def build_phi():
+    global phi
+    if os.path.exists('phi.pt'):
+        phi = torch.load("phi.pt").to('cuda').to(torch.float32)
+    else:
+        phi = get_spectral_filters(16 * 1024, K=24, device='cuda', dtype=torch.float32)
 
 if __name__ == '__main__':
     seq_len = 64

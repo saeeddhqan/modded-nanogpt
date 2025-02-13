@@ -1,5 +1,6 @@
 import math
 import torch
+from torch import Tensor
 nn = torch.nn
 F = nn.functional
 

@@ -1,7 +1,7 @@
 from util import *
 import math
 import torch
-from pscan.warp import scan
+# from pscan.warp import scan
 nn = torch.nn
 F = nn.functional
 
