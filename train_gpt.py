@@ -1,8 +1,10 @@
 import os
+from util import *
 os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6 8.9'
 import torch
-from pscan.warp import scan
-
+from LSGM import LSGM
+from attention import CausalSelfAttention
+from stu import STU, phi
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -27,269 +29,37 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 set_seed(1234)
 torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-use_lsgm = True
-
-class Linear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype),
-        )
+method = 'attn'
 
 
-class Conv1d(nn.Conv1d):
-    def _conv_forward(
-        self,
-        x: Tensor,
-        weight: Tensor,
-        bias: Tensor | None,
-    ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len=65536):
-        super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
-
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
-        super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
-        self.rotary = Rotary(dim // num_heads)
-        self.c_proj = Linear(dim, dim)
-        with torch.no_grad():
-            nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
-
-
-    def forward(self, x: Tensor) -> Tensor:
-        B, T, C = x.size()
-        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x))
-        q, k, v = qkv.view(B, T, 3 * self.num_heads, -1).chunk(3, dim=-2)
-        q = self.rotary(q)
-        k = self.rotary(k)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1 if self.training else 0.0, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
-class LSGM(nn.Module):
-    def __init__(self,
-        dim: int,
-        expansion_factor: int = 1.5,
-        kernel_size: int = 4,
-        num_slots: int = 32,
-        slot_dim: int = 384,
-        block_size: int = 65536,
-        lsg: bool = False,
-        mem_enhance: bool = True,
-    ):
-        super().__init__()
-        hidden = int(dim * expansion_factor)
-        self.input = Linear(dim, 2 * hidden, bias=False)
-        self.conv = Conv1d(in_channels=hidden, out_channels=hidden, bias=True,
-                              kernel_size=kernel_size, groups=hidden, padding=kernel_size - 1)
-        self.gates = Linear(hidden, 2 * hidden, bias=True)
-        self.lsg = lsg
-        if lsg:
-            bases = []
-            for x in range(num_slots):
-                bases.append(torch.linspace(-4.323, -9, hidden))
-            self.forget_base = nn.Parameter(torch.cat(bases).view(1, num_slots, 1, -1))
-        else:
-            self.forget_base = nn.Parameter(torch.linspace(-4.323, -9, hidden))
-        self.output = Linear(hidden, dim, bias=False)
-        self.mem_enhance = mem_enhance
-        if mem_enhance:
-            self.memory_slots = nn.Parameter(torch.randn(num_slots, slot_dim))
-            self.write_query = Linear(slot_dim, slot_dim, bias=False)
-            self.write_key = Linear(hidden, slot_dim, bias=False)
-            self.write_value = Linear(hidden, slot_dim, bias=False)
-            self.write_gate = Linear(hidden, 1, bias=False)
-            self.read_query = Linear(hidden, slot_dim, bias=False)
-            self.read_key = Linear(slot_dim, slot_dim, bias=False)
-            self.read_value = Linear(slot_dim, hidden, bias=False)
-        self.segment_length = block_size // num_slots
-        self.num_slots = num_slots
-        self.slot_dim = slot_dim
-        with torch.no_grad():
-            self.input.weight.normal_(std=dim ** -0.5)
-            self.gates.weight.normal_(std=hidden ** -0.5)
-            self.output.weight.normal_(std=hidden ** -0.5)
-            if mem_enhance:
-                nn.init.normal_(self.write_query.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.write_key.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.write_value.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.write_gate.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.read_query.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.read_key.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.read_value.weight, mean=0.0, std=0.02)
-                nn.init.normal_(self.memory_slots, std=0.02)
-
-    def write_memory(self, x: Tensor) -> Tensor:
-        B, T, _ = x.shape
-        segment_length = T // self.num_slots
-
-        # Reshape x into segments
-        x_segments = x.view(B, self.num_slots, segment_length, -1)
-
-        # Query, Key, and Value
-        q = self.write_query(self.memory_slots.to(x.dtype))  # [num_slots, slot_dim]
-        k = self.write_key(x_segments)  # [B, num_slots, segment_length, slot_dim]
-        v = self.write_value(x_segments)  # [B, num_slots, segment_length, slot_dim]
-
-        # Expand q to match B dimension
-        q = q.unsqueeze(0).expand(B, -1, -1)  # [B, num_slots, slot_dim]
-
-        # Each slot attends only to its corresponding segment
-        # Reshape k and v to match the B dimension
-        k = k.view(B, self.num_slots, segment_length, -1)  # [B, num_slots, segment_length, slot_dim]
-        v = v.view(B, self.num_slots, segment_length, -1)  # [B, num_slots, segment_length, slot_dim]
-
-        # Compute attention for each slot and segment
-        qk = torch.matmul(q.unsqueeze(2), k.transpose(-2, -1)) / math.sqrt(self.slot_dim)  # [B, num_slots, 1, segment_length]
-        attn = F.softmax(qk, dim=-1)  # [B, num_slots, 1, segment_length]
-
-        # Memory computation (without loop)
-        memory = torch.matmul(attn, v)  # [B, num_slots, 1, slot_dim]
-        memory = memory.squeeze(2)  # [B, num_slots, slot_dim]
-
-        return memory
-
-    def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
-        B, T, _ = x.shape
-        segment_length = T // self.num_slots
-        # Query, Key, and Value
-        q = self.read_query(x)      # [B, T, slot_dim]
-        k = self.read_key(memory)   # [B, num_slots, slot_dim]
-        v = self.read_value(memory) # [B, num_slots, dim]
-        # Compute attention scores
-        qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.slot_dim)  # [B, T, num_slots]
-        # Create causal mask for slots
-        # Each token i can only attend to slots j where j <= i//segment_length
-        mask = torch.arange(T, device=x.device).unsqueeze(1) // segment_length  # [T, 1] -> Which segment the token belongs to
-        mask = mask <= torch.arange(self.num_slots, device=x.device)  # [T, num_slots] -> Causal mask for each slot
-        # Apply causal mask: Replace where mask is 0 with -inf to prevent attention
-        qk = qk.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))  # [B, T, num_slots]
-        # Attention and output
-        attn = F.softmax(qk, dim=-1)  # [B, T, num_slots]
-        output = torch.matmul(attn, v)  # [B, T, dim]
-        # Apply gate
-        output = F.sigmoid(self.write_gate(x)) * output
-        return output
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.lsg:
-            return self.lsg_forward(x)
-        gate, x = self.input(x).chunk(2, dim=-1)
-        x = self.conv(x.mT)[..., :x.size(1)].mT
-        forget, inp = self.gates(x).chunk(2, dim=-1)
-        alpha = (-8 * F.softplus(self.forget_base.to(x.dtype)) * forget.sigmoid()).exp()
-        x = (1 - alpha ** 2 + 1e-6).sqrt() * inp.sigmoid() * x
-        h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-
-        if self.mem_enhance:  # this is a divergence from hawk
-            x = gate * gate.sigmoid() * x
-            mem = self.write_memory(x)
-            x = x + self.read_memory(x, mem)
-            return self.output(F.gelu(x) * h)
-
-        return self.output(F.gelu(gate) * h)
-
-    def lsg_forward(self, x: Tensor) -> Tensor:
-        gate, x = self.input(x).chunk(2, dim=-1)
-        x = self.conv(x.mT)[..., :x.size(1)].mT
-        forget, inp = self.gates(x).chunk(2, dim=-1)
-        B, T, C = forget.size()
-        forget = forget.view(B, self.num_slots, self.segment_length, C)
-
-        alpha = (-8 * F.softplus(self.forget_base.to(x.dtype)) * forget.sigmoid()).exp()
-        alpha = alpha.view(B, T, C).contiguous()
-        beta = (1 - alpha ** 2 + 1e-6).sqrt()
-        x = beta * inp.sigmoid() * x
-        h = scan(alpha.mT.contiguous(), x.mT.contiguous()).mT
-        if self.mem_enhance:  # this is a divergence from hawk
-            x = gate * gate.sigmoid() * x
-            mem = self.write_memory(x)
-            x = x + self.read_memory(x, mem)
-            return self.output(F.gelu(x) * h)
-        x = self.output(F.gelu(gate) * h)
-        return x
-
-
-class GatedMLP(nn.Module):
-    def __init__(self, dim: int = 1024, expansion_factor: int = 2):
-        super().__init__()
-        hidden = int(dim * expansion_factor)
-        self.grow = Linear(dim, 2 * hidden, bias=False)
-        self.shrink = Linear(hidden, dim, bias=False)
-
-        with torch.no_grad():
-            self.grow.weight.normal_(std=dim ** -0.5)
-            self.shrink.weight.normal_(std=hidden ** -0.5)
-
-    def forward(self, x: Tensor) -> Tensor:
-        gate, x = self.grow(x).chunk(2, dim=-1)
-        x = F.gelu(gate) * x
-        return self.shrink(x)
-
-class MLP(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.c_fc = Linear(dim, 4 * dim)
-        self.c_proj = Linear(4 * dim, dim)
-        with torch.no_grad():
-            nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
-            nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.gelu(x)
-        x = self.c_proj(x)
-        return x
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
-
-        self.attn = CausalSelfAttention(dim, num_heads) if use_lsgm is False else LSGM(dim)
-        self.mlp = MLP(dim) if use_lsgm is False else GatedMLP(dim)
+        seqlen = 16 * 1024
+        if method == 'attn':
+            self.attn = CausalSelfAttention(dim, num_heads)
+        elif method == 'lsgm':
+            self.attn = LSGM(dim)
+        elif 'stu' in method:
+            n = nearest_power_of_two(seqlen * 2 - 1, round_up=True)
+            self.attn = STU(
+                n_embd=dim,
+                num_eigh=24,
+                torch_dtype=torch.float32,
+                phi=phi,
+                n=n,
+                gating=True if 'gating' in method else False,
+            ).to(device)
+        else:
+            raise Exception("method not found")
+        self.mlp = MLP(dim) if method != 'lsgm' else GatedMLP(dim)
 
     def forward(self, x):
         x = x + self.attn(norm(x))
         x = x + self.mlp(norm(x))
         return x
 
-
-def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class Model(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
