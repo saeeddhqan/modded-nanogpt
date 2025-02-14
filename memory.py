@@ -28,9 +28,8 @@ class memory(nn.Module):
         # Only the first instance gets write projections
         if idx == 0:
             self.memory_slots = nn.Parameter(torch.randn(num_slots, dim))
-            self.write_q, self.write_kv = tuple(
-                Linear(dim, dim, bias=False) for _ in range(2)
-            )
+            self.write_q  = Linear(dim, dim, bias=False)
+            self.write_kv = Linear(dim, dim * 2, bias=False)
             self.write_matter = nn.Parameter(torch.ones(dim) * 0.01)
 
         # Initialize parameters
