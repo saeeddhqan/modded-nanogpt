@@ -9,8 +9,8 @@ class memory(nn.Module):
     def __init__(self,
         dim: int,
         idx: int,
-        num_slots: int = 8,
-        num_heads: int = 1,
+        num_slots: int = 16,
+        num_heads: int = 4,
         block_size: int = 65536,
         dropout: float = 0.1,
     ):
@@ -21,25 +21,25 @@ class memory(nn.Module):
         self.head_dim = dim // num_heads
         self.dropout = dropout
         assert num_slots <= block_size, "invalid num slots"
-
+        self.gate = Linear(dim, dim, bias=False)
         # Create read projections
         self.read_q = Linear(dim, dim, bias=False)
         self.read_kv = Linear(dim, dim * 2, bias=False)
         # Only the first instance gets write projections
         if idx == 0:
             self.memory_slots = nn.Parameter(torch.randn(num_slots, dim))
-            self.write_q, self.write_k, self.write_v = tuple(
-                Linear(dim, dim, bias=False) for _ in range(3)
+            self.write_q, self.write_kv = tuple(
+                Linear(dim, dim, bias=False) for _ in range(2)
             )
             self.write_matter = nn.Parameter(torch.ones(dim) * 0.01)
 
         # Initialize parameters
         with torch.no_grad():
-            for layer in (self.read_q, self.read_kv):
+            for layer in (self.read_q, self.read_kv, self.gate):
                 nn.init.normal_(layer.weight, std=0.02)
             if idx == 0:
                 nn.init.normal_(self.memory_slots, std=0.02)
-                for layer in (self.write_q, self.write_k, self.write_v):
+                for layer in (self.write_q, self.write_kv):
                     nn.init.normal_(layer.weight, std=0.02)
 
     def write_memory(self, x: Tensor) -> Tensor:
@@ -49,8 +49,7 @@ class memory(nn.Module):
         x_segments = x.view(B, self.num_slots, segment_length, -1)
 
         # Project to multi-head key and value
-        k = self.write_k(x_segments)  # [B, num_slots, segment_length, dim]
-        v = self.write_v(x_segments)  # [B, num_slots, segment_length, dim]
+        k, v = self.write_kv(x_segments).chunk(2, dim=-1)  # [B, num_slots, segment_length, dim]
         
         # Reshape k and v to separate heads
         k = k.view(B, self.num_slots, segment_length, self.num_heads, self.head_dim)
@@ -89,6 +88,8 @@ class memory(nn.Module):
         # Query, Key, and Value
         q = self.read_q(x)      # [B, T, dim]
         k, v = self.read_kv(memory).chunk(2, dim=-1) # [B, num_slots, dim]
+        k = k.to(x.dtype)
+        v = v.to(x.dtype)
         # Compute attention scores
         qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.dim)  # [B, T, num_slots]
         # Create causal mask for slots
@@ -99,14 +100,16 @@ class memory(nn.Module):
         qk = qk.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))  # [B, T, num_slots]
         # Attention and output
         attn = F.softmax(qk, dim=-1)  # [B, T, num_slots]
+
         output = torch.matmul(attn, v) # [B, T, dim]
         return output
 
     def forward(self, x: Tensor, memory: Tensor | None) -> Tensor:
+        h = self.gate(x)
         if self.idx == 0:
             memory = self.write_memory(x)
         x = self.read_memory(x, memory)
-        return F.silu(x), memory
+        return norm(F.sigmoid(h) * F.silu(x)), memory
 
 if __name__ == "__main__":
     # check the output of both write methods

@@ -41,11 +41,12 @@ class STU(nn.Module):
         )
         if self.gating:
             self.cross_attn = memory(n_embd, idx=idx, block_size=n)
-
+            self.write_matter = nn.Parameter(torch.ones(n_embd) * 0.01)
 
     def forward(self, x: torch.Tensor, mem: torch.Tensor | None) -> torch.Tensor:
         if self.gating:
-            x, mem = self.cross_attn(x, mem)
+            y, mem = self.cross_attn(x, mem)
+            x = (x + (self.write_matter * y)).to(x.dtype)
         return self.spectral(x), mem
 
     def spectral(self, x: torch.Tensor) -> torch.Tensor:

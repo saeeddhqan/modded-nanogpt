@@ -34,6 +34,8 @@ python data/cached_fineweb10B.py 8 # downloads only the first 0.8B training toke
 python -m pip install --upgrade 'optree>=0.13.0'
 apt-get install build-essential
 apt-get install python3-dev
+apt-get install screen
+screen -S train
 ./run.sh
 ```
 
