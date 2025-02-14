@@ -73,7 +73,9 @@ class Model(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, idx) for idx in range(num_layers)])
         self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
+        self.embed.weight = self.lm_head.weight
         nparams = self.num_params() / 1e6
+        self.apply(self.norm_weights)
         print0("Number of parameters: %.3fM" % (nparams,))
         print("Number of parameters: %.3fM" % (nparams,))
 
@@ -81,6 +83,11 @@ class Model(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         n_params -= self.embed.weight.numel()
         return n_params
+
+    def norm_weights(self, module):
+        if isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 
     def forward(self, input_seq: Tensor, target_seq: Tensor):
         x = self.embed(input_seq)[None]

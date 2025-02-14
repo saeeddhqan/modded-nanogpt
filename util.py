@@ -59,9 +59,17 @@ class MLP(nn.Module):
         return x
 
 
-def norm(x):
+def norm1(x):
     return F.rms_norm(x, (x.size(-1),))
 
+def norm2(x):
+    rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt() + 1e-8
+    return x / rms
+
+if hasattr(F, 'rms_norm'):
+    norm = norm1
+else:
+    norm = norm2
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)

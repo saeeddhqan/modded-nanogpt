@@ -19,7 +19,7 @@ except ImportError as e:
 K = 16
 
 class STU(nn.Module):
-    def __init__(self, n_embd, torch_dtype, phi, n, idx, gating: bool = False) -> None:
+    def __init__(self, n_embd, torch_dtype, phi, n, idx, K: int = K, gating: bool = False) -> None:
         super(STU, self).__init__()
         self.phi = phi
         self.n = n
@@ -34,10 +34,10 @@ class STU(nn.Module):
         )
 
         self.M_phi_plus = nn.Parameter(
-            torch.empty(self.K, self.dim, self.dim, dtype=torch_dtype)
+            torch.randn(self.K, self.dim, self.dim, dtype=torch_dtype) * 1e-5
         )
         self.M_phi_minus = nn.Parameter(
-            torch.empty(self.K, self.dim, self.dim, dtype=torch_dtype)
+            torch.randn(self.K, self.dim, self.dim, dtype=torch_dtype) * 1e-5
         )
         if self.gating:
             self.cross_attn = memory(n_embd, idx=idx, block_size=n)
@@ -46,8 +46,6 @@ class STU(nn.Module):
     def forward(self, x: torch.Tensor, mem: torch.Tensor | None) -> torch.Tensor:
         if self.gating:
             x, mem = self.cross_attn(x, mem)
-        else:
-            mem = None
         return self.spectral(x), mem
 
     def spectral(self, x: torch.Tensor) -> torch.Tensor:
@@ -61,14 +59,12 @@ class STU(nn.Module):
         # U_plus shape is (batch, seqlen, num_eigh(self.K), n_embd)
         # U_minus shape is (batch, seqlen, num_eigh(self.K), n_embd)
         # Then, contract over the K and d_in dimensions
-
         spectral_plus = torch.tensordot(
             U_plus, self.M_phi_plus, dims=([2, 3], [0, 1])
         )
         spectral_minus = torch.tensordot(
             U_minus, self.M_phi_minus, dims=([2, 3], [0, 1])
         )
-
         return spectral_plus + spectral_minus
 
 
@@ -94,7 +90,6 @@ def get_spectral_filters(
     Z = get_hankel(seq_len)
     # Compute eigenvalues and eigenvectors for symmetric matrices
     sigma, phi = torch.linalg.eigh(Z)
-    print('eigh done')
     # Select the largest K eigenvalues and corresponding eigenvectors
     sigma, phi = sigma[-K:], phi[:, -K:]
     # Scale the eigenvectors with the eigenvalues raised to 0.25 (broadcasting applies)
@@ -162,9 +157,10 @@ def flash_convolve(
 
 phi = None
 @torch.no_grad
-def build_phi():
+def build_phi(seqlen: int = 16 * 1024, K: int = K, device: str = 'cuda'):
     global phi
-    phi = get_spectral_filters(16 * 1024, K=K, device='cuda', dtype=torch.float32)
+    phi = get_spectral_filters(seqlen, K=K, device=device, dtype=torch.float32)
+    return phi
 
 if __name__ == '__main__':
     seq_len = 256
