@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from memory import memory
 import math
-import os
+import os, random
 try:
     from flashfftconv import FlashFFTConv
 
@@ -19,13 +19,21 @@ except ImportError as e:
 K = 16
 
 class STU(nn.Module):
-    def __init__(self, n_embd, torch_dtype, phi, n, idx, K: int = K, gating: bool = False) -> None:
+    def __init__(
+        self,
+        n_embd,
+        torch_dtype,
+        phi, n, idx,
+        K: int = K,
+        use_gating: bool = False,
+        num_slots: int = 16,
+    ) -> None:
         super(STU, self).__init__()
         self.phi = phi
         self.n = n
         self.K = K
         self.dim = n_embd
-        self.gating = gating
+        self.use_gating = use_gating
         self.use_approx = False
         self.flash_fft = (
             FlashFFTConv(self.n, dtype=torch.bfloat16) if
@@ -39,14 +47,22 @@ class STU(nn.Module):
         self.M_phi_minus = nn.Parameter(
             torch.randn(self.K, self.dim, self.dim, dtype=torch_dtype) * 1e-5
         )
-        if self.gating:
-            self.cross_attn = memory(n_embd, idx=idx, block_size=n)
+        if self.use_gating:
+            self.cross_attn = memory(
+                n_embd,
+                idx=idx,
+                block_size=n,
+                num_slots=num_slots, 
+            )
+            self.gate = Linear(self.dim, self.dim, bias=False)
+            self.gate.weight.detach().zero_()
             self.write_matter = nn.Parameter(torch.ones(n_embd) * 0.01)
 
     def forward(self, x: torch.Tensor, mem: torch.Tensor | None) -> torch.Tensor:
-        if self.gating:
+        if self.use_gating:
+            h = self.gate(x)
             y, mem = self.cross_attn(x, mem)
-            x = (x + (self.write_matter * y)).to(x.dtype)
+            x = norm(x + (F.sigmoid(h) * y) * self.write_matter).to(x.dtype)
         return self.spectral(x), mem
 
     def spectral(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,6 +85,67 @@ class STU(nn.Module):
         return spectral_plus + spectral_minus
 
 
+class STUBlock(nn.Module):
+    def __init__(self, idx: int, dim: int, n: int, K: int, phi: torch.Tensor, num_slots: int = 16,
+        use_gating: bool = False, device: torch.device = 'cpu', dtype = torch.float32):
+        super().__init__()
+        self.communicate = STU(
+            n_embd=dim,
+            idx=idx,
+            torch_dtype=dtype,
+            phi=phi,
+            n=n,
+            K=K,
+            num_slots=num_slots,
+            use_gating=use_gating,
+        )
+        self.mlp = MLP(dim)
+
+    def forward(self, x, mem: torch.Tensor | None = None):
+        y, mem = self.communicate(norm(x), mem)
+        x = x + y
+        x = x + self.mlp(norm(x))
+        return y, mem
+
+class STUModel(nn.Module):
+    def __init__(self, dim: int, seqlen: int, nlayers: int, K: int, vocab_size: int,
+        num_slots: int = 16, use_gating: bool = False, device: torch.device = 'cpu', dtype = torch.float32):
+        super().__init__()
+        with torch.no_grad():
+            self.phi = get_spectral_filters(seqlen, K=K, device=device, dtype=torch.float32)
+        self.nlayers = nlayers
+        self.embed = nn.Embedding(vocab_size, dim)
+        n = nearest_power_of_two(seqlen * 2 - 1, round_up=True)
+        self.layers = nn.ModuleList([STUBlock(
+            idx=idx,
+            dim=dim,
+            dtype=dtype,
+            phi=self.phi,
+            n=n,
+            K=K,
+            num_slots=num_slots,
+            use_gating=use_gating,
+        ) for idx in range(nlayers)])
+        self.lm_head = Linear(dim, next_multiple_of_n(vocab_size, n=vocab_size))
+        with torch.no_grad():
+            self.lm_head.weight.normal_(std=dim ** -0.5)
+
+    def forward(self, x, target_seq: torch.Tensor | None = None):
+        if x.ndim == 2:
+            x = self.embed(x)
+        mem = None
+        mean_layers = []
+        for i in self.layers:
+            x, mem = i(x, mem)
+            with torch.no_grad():
+                mean_layers.append(x.mean().item())
+        x = norm(x)
+        logits = self.lm_head(x)
+        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+        loss = None
+        if isinstance(target_seq, torch.Tensor):
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq.flatten())
+        return loss, logits, mean_layers
 
 
 def get_hankel(seq_len: int) -> torch.Tensor:
@@ -77,7 +154,7 @@ def get_hankel(seq_len: int) -> torch.Tensor:
     # Compute the outer sum
     i_plus_j = entries[:, None] + entries[None, :]
     # Calculate Z using element-wise operations
-    Z = 2.0 / (i_plus_j**3 - i_plus_j)
+    Z = 2.0 / ((i_plus_j**3 - i_plus_j) + 1e-7)
     return Z
 
 
@@ -156,12 +233,6 @@ def flash_convolve(
 
     return U_plus, U_minus
 
-phi = None
-@torch.no_grad
-def build_phi(seqlen: int = 16 * 1024, K: int = K, device: str = 'cuda'):
-    global phi
-    phi = get_spectral_filters(seqlen, K=K, device=device, dtype=torch.float32)
-    return phi
 
 if __name__ == '__main__':
     seq_len = 256

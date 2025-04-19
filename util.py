@@ -50,11 +50,12 @@ class MLP(nn.Module):
         self.c_proj = Linear(4 * dim, dim)
         with torch.no_grad():
             nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
-            nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
+            # nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
+            self.c_proj.weight.detach().zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 

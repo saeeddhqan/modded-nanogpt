@@ -10,7 +10,8 @@ class memory(nn.Module):
         dim: int,
         idx: int,
         num_slots: int = 16,
-        num_heads: int = 4,
+        num_heads: int = 1,
+        num_heads_qkv: int = 1,
         block_size: int = 65536,
         dropout: float = 0.1,
     ):
@@ -19,9 +20,11 @@ class memory(nn.Module):
         self.segment_length = block_size // num_slots
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.num_heads_qkv = num_heads_qkv
+        self.head_dim_qkv = dim // self.num_heads_qkv
+
         self.dropout = dropout
         assert num_slots <= block_size, "invalid num slots"
-        self.gate = Linear(dim, dim, bias=False)
         # Create read projections
         self.read_q = Linear(dim, dim, bias=False)
         self.read_kv = Linear(dim, dim * 2, bias=False)
@@ -30,32 +33,32 @@ class memory(nn.Module):
             self.memory_slots = nn.Parameter(torch.randn(num_slots, dim))
             self.write_q  = Linear(dim, dim, bias=False)
             self.write_kv = Linear(dim, dim * 2, bias=False)
-            self.write_matter = nn.Parameter(torch.ones(dim) * 0.01)
+            
+            self.write_qkv = Linear(dim, dim * 3, bias=False)
+            self.write_proj = Linear(dim, dim, bias=False)
 
         # Initialize parameters
         with torch.no_grad():
-            for layer in (self.read_q, self.read_kv, self.gate):
+            for layer in (self.read_q, self.read_kv):
                 nn.init.normal_(layer.weight, std=0.02)
             if idx == 0:
                 nn.init.normal_(self.memory_slots, std=0.02)
-                for layer in (self.write_q, self.write_kv):
+                for layer in (self.write_q, self.write_kv, self.write_qkv, self.write_proj):
                     nn.init.normal_(layer.weight, std=0.02)
 
     def write_memory(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
         segment_length = T // self.num_slots
-        
         x_segments = x.view(B, self.num_slots, segment_length, -1)
-
         # Project to multi-head key and value
         k, v = self.write_kv(x_segments).chunk(2, dim=-1)  # [B, num_slots, segment_length, dim]
-        
+
         # Reshape k and v to separate heads
         k = k.view(B, self.num_slots, segment_length, self.num_heads, self.head_dim)
         v = v.view(B, self.num_slots, segment_length, self.num_heads, self.head_dim)
-        
+
         # Project memory slots to queries
-        q = self.write_q(self.memory_slots.to(x.dtype))  # [num_slots, dim]
+        q = self.write_q(norm(self.memory_slots).to(x.dtype))  # [num_slots, dim]
         q = q.view(self.num_slots, self.num_heads, self.head_dim)  # [num_slots, num_heads, head_dim]
         q = q[None,...].expand(B, -1, -1, -1)  # [B, num_slots, num_heads, head_dim]
 
@@ -78,8 +81,18 @@ class memory(nn.Module):
         memory = memory.squeeze(3)  # [B, num_heads, num_slots, head_dim]
         memory = memory.permute(0, 2, 1, 3)  # [B, num_slots, num_heads, head_dim]
         memory = memory.reshape(B, self.num_slots, -1)  # [B, num_slots, dim]
+        return memory
 
-        return norm(memory * self.write_matter)
+    def write_attn(self, x: Tensor) -> Tensor:
+        B, T, C = x.shape
+        q, k, v = self.write_qkv(x).chunk(3, dim=-1)
+        q = q.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
+        k = k.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
+        v = v.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
+        attn_output = F.scaled_dot_product_attention(q, k, v,
+            dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+        return self.write_proj(attn_output)
 
     def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
         B, T, _ = x.shape
@@ -104,11 +117,11 @@ class memory(nn.Module):
         return output
 
     def forward(self, x: Tensor, memory: Tensor | None) -> Tensor:
-        h = self.gate(x)
         if self.idx == 0:
             memory = self.write_memory(x)
+            memory = self.write_attn(memory)
         x = self.read_memory(x, memory)
-        return norm(F.sigmoid(h) * F.silu(x)), memory
+        return x, memory
 
 if __name__ == "__main__":
     # check the output of both write methods

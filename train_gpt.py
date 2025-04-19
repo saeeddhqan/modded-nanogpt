@@ -95,7 +95,8 @@ class Model(nn.Module):
         for block in self.blocks:
             x, mem = block(x, mem)
         x = norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x).float()
+        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
 
