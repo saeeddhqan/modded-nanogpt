@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import random
 import string
 import stu
+from model import Model
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -46,7 +47,7 @@ class CopyingTaskDataset(Dataset):
         data = self.data[idx]
         input_seq = data + [self.vocab_size  for _ in range(self.seqlen)]
         if self.reverse:
-            data.reverse()
+            data = data[::-1]
         target_seq = [self.vocab_size  for _ in range(self.seqlen)] + data
         input_seq = torch.tensor(input_seq, dtype=torch.long)
         target_seq = torch.tensor(target_seq, dtype=torch.long)
@@ -58,16 +59,23 @@ batch_size = 64
 num_epochs = 10
 
 vocab_size = 10 # Lowercase letters
-embed_dim = 8
-seqlen = 512
-nlayers = 8
+embed_dim = 32
+seqlen = 32
+nlayers = 10
+
 K = 8
-num_slots = 64
-use_gating = True
+num_slots = 4
+use_gating = False
+
 reverse_case = True
 device = 'cuda'
-model = stu.STUModel(dim=embed_dim, seqlen=seqlen, nlayers=nlayers, K=K,
-    num_slots=num_slots, vocab_size=vocab_size + 1, use_gating=use_gating, device=device)
+method = 'attn'
+dtype = torch.float32
+is_causal = False
+# model = stu.STUModel(dim=embed_dim, seqlen=seqlen, nlayers=nlayers, K=K,
+    # num_slots=num_slots, vocab_size=vocab_size + 1, use_gating=use_gating, device=device)
+model = Model(vocab_size=vocab_size + 1, num_layers=nlayers, model_dim=embed_dim, method=method, num_heads=2, seqlen=seqlen, is_causal=is_causal, K=K,
+    num_slots=num_slots, use_gating=use_gating, device=device, dtype=dtype)
 model.to(device)
 optimizer = optim.AdamW(model.parameters(), lr=1e-3)
 
@@ -88,7 +96,7 @@ def train_model():
         for input_seq, target_seq in train_loader:
             input_seq, target_seq = input_seq.to(device), target_seq.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss, _, _= model(input_seq, target_seq)  # Shape: (batch_size, seqlen, vocab_size)
+            loss, _= model(input_seq, target_seq)  # Shape: (batch_size, seqlen, vocab_size)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
@@ -108,7 +116,7 @@ def evaluate_model():
     with torch.no_grad():
         for input_seq, target_seq in test_loader:
             input_seq, target_seq = input_seq.to(device), target_seq.to(device)
-            _, logits, _ = model(input_seq)
+            _, logits = model(input_seq)
             predictions = torch.argmax(logits, dim=-1)  # Get most probable tokens
 
             correct += (predictions == target_seq).sum().item()

@@ -2,10 +2,7 @@ import os
 from util import *
 os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6 8.9'
 import torch
-# from LSGM import LSGM
-from attention import CausalSelfAttention
-import stu
-
+from model import Model
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
@@ -30,75 +27,9 @@ def set_seed(seed: int):
 set_seed(1234)
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 dtype = torch.bfloat16
-method = 'stu+gating'
-if 'stu' in method:
-    stu.build_phi()
+device = 'cuda'
+method = 'stu'
 
-
-class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, idx: int):
-        super().__init__()
-        seqlen = 16 * 1024
-        if method == 'attn':
-            self.attn = CausalSelfAttention(dim, num_heads)
-        elif method == 'lsgm':
-            self.attn = LSGM(dim)
-        elif 'stu' in method:
-            n = nearest_power_of_two(seqlen * 2 - 1, round_up=True)
-            self.attn = stu.STU(
-                n_embd=dim,
-                idx=idx,
-                torch_dtype=dtype,
-                phi=stu.phi,
-                n=n,
-                gating=True if 'gating' in method else False,
-            ).to(device)
-        else:
-            raise Exception("method not found")
-        self.mlp = MLP(dim) if method != 'lsgm' else GatedMLP(dim)
-
-    def forward(self, x, mem):
-        if 'stu' not in method:
-            x = x + self.attn(norm(x))
-        else:
-            y, mem = self.attn(norm(x), mem)
-            x = x + y
-        x = x + self.mlp(norm(x))
-        return x, mem
-
-
-class Model(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, idx) for idx in range(num_layers)])
-        self.lm_head = Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        self.embed.weight = self.lm_head.weight
-        nparams = self.num_params() / 1e6
-        self.apply(self.norm_weights)
-        print0("Number of parameters: %.3fM" % (nparams,))
-        print("Number of parameters: %.3fM" % (nparams,))
-
-    def num_params(self) -> int:
-        n_params = sum(p.numel() for p in self.parameters())
-        n_params -= self.embed.weight.numel()
-        return n_params
-
-    def norm_weights(self, module):
-        if isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-
-    def forward(self, input_seq: Tensor, target_seq: Tensor):
-        x = self.embed(input_seq)[None]
-        mem = None
-        for block in self.blocks:
-            x, mem = block(x, mem)
-        x = norm(x)
-        logits = self.lm_head(x).float()
-        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
-        return loss
 
 def _load_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
@@ -184,7 +115,7 @@ print0("="*100)
 # load data
 train_loader = distributed_data_generator(args.train_files, args.batch_size, rank, world_size)
 
-model = Model(vocab_size=50257, num_layers=8, num_heads=2, model_dim=128).cuda()
+model = Model(vocab_size=50257, num_layers=8, num_heads=2, model_dim=128, method=method, seqlen=args.seq_len).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()

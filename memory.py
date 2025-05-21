@@ -9,11 +9,13 @@ class memory(nn.Module):
     def __init__(self,
         dim: int,
         idx: int,
+        is_causal: bool,
         num_slots: int = 16,
         num_heads: int = 1,
         num_heads_qkv: int = 1,
         block_size: int = 65536,
         dropout: float = 0.1,
+        activation: str = 'sigmoid',
     ):
         super().__init__()
         self.idx, self.dim, self.num_slots = idx, dim, num_slots
@@ -45,6 +47,11 @@ class memory(nn.Module):
                 nn.init.normal_(self.memory_slots, std=0.02)
                 for layer in (self.write_q, self.write_kv, self.write_qkv, self.write_proj):
                     nn.init.normal_(layer.weight, std=0.02)
+        if activation == 'softmax':
+            self.act = lambda x: F.softmax(x, dim=-1)
+        else:
+            self.act = lambda x: F.sigmoid(x)
+        self.is_causal = is_causal
 
     def write_memory(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
@@ -90,9 +97,9 @@ class memory(nn.Module):
         k = k.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
         v = v.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
         attn_output = F.scaled_dot_product_attention(q, k, v,
-            dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            dropout_p=0.0, is_causal=self.is_causal)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
-        return self.write_proj(attn_output)
+        return norm(self.write_proj(attn_output))
 
     def read_memory(self, x: Tensor, memory: Tensor) -> Tensor:
         B, T, _ = x.shape
@@ -106,12 +113,13 @@ class memory(nn.Module):
         qk = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.dim)  # [B, T, num_slots]
         # Create causal mask for slots
         # Each token i can only attend to slots j where j <= i//segment_length
-        mask = torch.arange(T, device=x.device).unsqueeze(1) // segment_length  # [T, 1] -> Which segment the token belongs to
-        mask = mask <= torch.arange(self.num_slots, device=x.device)  # [T, num_slots] -> Causal mask for each slot
-        # Apply causal mask: Replace where mask is 0 with -inf to prevent attention
-        qk = qk.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))  # [B, T, num_slots]
+        if self.is_causal:
+            mask = torch.arange(T, device=x.device).unsqueeze(1) // segment_length  # [T, 1] -> Which segment the token belongs to
+            mask = mask <= torch.arange(self.num_slots, device=x.device)  # [T, num_slots] -> Causal mask for each slot
+            # Apply causal mask: Replace where mask is 0 with -inf to prevent attention
+            qk = qk.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))  # [B, T, num_slots]
         # Attention and output
-        attn = F.softmax(qk, dim=-1)  # [B, T, num_slots]
+        attn = self.act(qk)  # [B, T, num_slots]
 
         output = torch.matmul(attn, v) # [B, T, dim]
         return output

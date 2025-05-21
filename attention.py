@@ -1,6 +1,7 @@
 from util import *
 import math
 import torch
+from memory import memory
 nn = torch.nn
 F = nn.functional
 
@@ -12,8 +13,10 @@ class Rotary(nn.Module):
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
+        # self.cos = nn.Buffer(theta.cos(), persistent=False)
+        # self.sin = nn.Buffer(theta.sin(), persistent=False)
+        self.register_buffer('cos', theta.cos(), persistent=False)
+        self.register_buffer('sin', theta.sin(), persistent=False)
 
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
@@ -24,7 +27,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, idx: int, seqlen: int, is_causal: bool, num_slots: int, use_gating: bool = False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -33,11 +36,29 @@ class CausalSelfAttention(nn.Module):
         self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
         self.rotary = Rotary(dim // num_heads)
         self.c_proj = Linear(dim, dim)
+        self.use_gating = use_gating
+        if use_gating:
+            self.cross_attn = memory(
+                dim,
+                idx=idx,
+                block_size=seqlen,
+                num_slots=num_slots,
+                is_causal=is_causal,
+            )
+            self.gate = Linear(dim, dim, bias=False)
+            self.gate.weight.detach().zero_()
+            self.write_matter = nn.Parameter(torch.ones(dim) * 0.1)
+
         with torch.no_grad():
             nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
+        self.is_causal = is_causal
 
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mem: Tensor | None) -> Tensor:
+        if self.use_gating:
+            h = self.gate(x)
+            y, mem = self.cross_attn(x, mem)
+            x = norm(x + (F.sigmoid(h) * y) * self.write_matter).to(x.dtype)
         B, T, C = x.size()
         qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x))
         q, k, v = qkv.view(B, T, 3 * self.num_heads, -1).chunk(3, dim=-2)
@@ -46,7 +67,7 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1 if self.training else 0.0, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1 if self.training else 0.0, is_causal=self.is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y
+        return y, mem
