@@ -29,24 +29,26 @@ class memory(nn.Module):
         assert num_slots <= block_size, "invalid num slots"
         # Create read projections
         self.read_q = Linear(dim, dim, bias=False)
-        self.read_kv = Linear(dim, dim * 2, bias=False)
+        self.read_v = Linear(dim, dim, bias=False)
+        self.read_k = Linear(dim, dim, bias=False)
         # Only the first instance gets write projections
         if idx == 0:
             self.memory_slots = nn.Parameter(torch.randn(num_slots, dim))
             self.write_q  = Linear(dim, dim, bias=False)
-            self.write_kv = Linear(dim, dim * 2, bias=False)
+            self.write_k  = Linear(dim, dim, bias=False)
+            self.write_v  = Linear(dim, dim, bias=False)
             
             self.write_qkv = Linear(dim, dim * 3, bias=False)
             self.write_proj = Linear(dim, dim, bias=False)
 
         # Initialize parameters
-        with torch.no_grad():
-            for layer in (self.read_q, self.read_kv):
-                nn.init.normal_(layer.weight, std=0.02)
-            if idx == 0:
-                nn.init.normal_(self.memory_slots, std=0.02)
-                for layer in (self.write_q, self.write_kv, self.write_qkv, self.write_proj):
-                    nn.init.normal_(layer.weight, std=0.02)
+        # with torch.no_grad():
+        #     for layer in (self.read_q, self.read_k, self.read_v):
+        #         nn.init.normal_(layer.weight, std=0.02)
+        #     if idx == 0:
+        #         nn.init.normal_(self.memory_slots, std=0.02)
+        #         for layer in (self.write_q, self.write_k, self.write_v, self.write_qkv, self.write_proj):
+        #             nn.init.normal_(layer.weight, std=0.02)
         if activation == 'softmax':
             self.act = lambda x: F.softmax(x, dim=-1)
         else:
@@ -58,7 +60,7 @@ class memory(nn.Module):
         segment_length = T // self.num_slots
         x_segments = x.view(B, self.num_slots, segment_length, -1)
         # Project to multi-head key and value
-        k, v = self.write_kv(x_segments).chunk(2, dim=-1)  # [B, num_slots, segment_length, dim]
+        k, v = self.write_k(x_segments), self.write_v(x_segments)  # [B, num_slots, segment_length, dim]
 
         # Reshape k and v to separate heads
         k = k.view(B, self.num_slots, segment_length, self.num_heads, self.head_dim)
@@ -80,7 +82,6 @@ class memory(nn.Module):
         memory = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,
-            dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
         )  # [B, num_heads, num_slots, 1, head_dim]
 
@@ -96,8 +97,7 @@ class memory(nn.Module):
         q = q.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
         k = k.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
         v = v.view(B, T, self.num_heads_qkv, self.head_dim_qkv).transpose(1, 2)
-        attn_output = F.scaled_dot_product_attention(q, k, v,
-            dropout_p=0.0, is_causal=self.is_causal)
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
         return norm(self.write_proj(attn_output))
 
@@ -106,7 +106,7 @@ class memory(nn.Module):
         segment_length = T // self.num_slots
         # Query, Key, and Value
         q = self.read_q(x)      # [B, T, dim]
-        k, v = self.read_kv(memory).chunk(2, dim=-1) # [B, num_slots, dim]
+        k, v = self.read_k(memory), self.read_v(memory) # [B, num_slots, dim]
         k = k.to(x.dtype)
         v = v.to(x.dtype)
         # Compute attention scores

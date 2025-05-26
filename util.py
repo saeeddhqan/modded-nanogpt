@@ -3,6 +3,7 @@ import torch
 from torch import Tensor
 nn = torch.nn
 F = nn.functional
+import matplotlib.pyplot as plt
 
 
 class Linear(nn.Linear):
@@ -42,20 +43,30 @@ class GatedMLP(nn.Module):
         x = F.gelu(gate) * x
         return self.shrink(x)
 
+class SquishSiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        silu = F.gelu(x)
+        return silu
+        # return torch.where(x < 0, silu, silu ** 2)
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.c_fc = Linear(dim, 4 * dim)
         self.c_proj = Linear(4 * dim, dim)
-        with torch.no_grad():
-            nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
-            # nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
-            self.c_proj.weight.detach().zero_()
+        self.act = SquishSiLU()
+        # with torch.no_grad():
+            # nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
+            # nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.01)
+            # self.c_proj.weight.detach().zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = self.act(x)
+        # x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -81,3 +92,57 @@ def nearest_power_of_two(x: int, round_up: bool = False) -> int:
         1 << math.floor(math.log2(x)) if not round_up else 1 << math.ceil(math.log2(x))
     )
 
+
+class TensorTracker:
+    def __init__(self):
+        self.data = {}  # {name: {"means": [...], "stds": [...], "mins": [...], "maxs": [...], "hist": [...]}}
+
+    def track(self, name, tensor: torch.Tensor):
+        tensor = tensor.detach().cpu().float()
+        # Basic checks
+        if torch.isnan(tensor).any():
+            print(f"[NaN] in {name}")
+            return
+        if torch.isinf(tensor).any():
+            print(f"[Inf] in {name}")
+            return
+
+        if name not in self.data:
+            self.data[name] = {"means": [], "stds": [], "mins": [], "maxs": [], "hist": []}
+
+        self.data[name]["means"].append(tensor.mean().item())
+        self.data[name]["stds"].append(tensor.std().item())
+        self.data[name]["mins"].append(tensor.min().item())
+        self.data[name]["maxs"].append(tensor.max().item())
+        self.data[name]["hist"].append(tensor.flatten().numpy())
+
+
+    def plot_all(self):
+        for name, stats in self.data.items():
+            self._plot_stats(name, stats)
+
+    def _plot_stats(self, name, stats):
+        steps = range(len(stats["means"]))
+        fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle(f'Tensor: {name}', fontsize=16)
+
+        axs[0].plot(steps, stats["means"], label='Mean')
+        axs[0].plot(steps, stats["stds"], label='Std')
+        axs[0].set_title("Mean & Std")
+        axs[0].legend()
+
+        axs[1].plot(steps, stats["mins"], label='Min')
+        axs[1].plot(steps, stats["maxs"], label='Max')
+        axs[1].set_title("Min & Max")
+        axs[1].legend()
+
+        axs[2].hist(stats["hist"][-1], bins=50)
+        axs[2].set_title("Last Histogram")
+
+        plt.tight_layout()
+        plt.show()
+
+def generate_synthetic_data(seqlen, dim, nsamples: int = 15):
+    x_data = torch.randn(nsamples, 1, seqlen, dim)
+    y_data = torch.randint(128, (nsamples, 1, seqlen))  # dummy targets
+    return list(zip(x_data, y_data))

@@ -26,11 +26,15 @@ class Block(nn.Module):
         else:
             raise Exception("method not found")
         self.mlp = MLP(dim) if method != 'lsgm' else GatedMLP(dim)
+        self.res_con = True
 
     def forward(self, x, mem):
         y, mem = self.attn(norm(x), mem)
-        x = x + y
-        x = x + self.mlp(norm(x))
+        if self.res_con:
+            x = x + y
+            x = x + self.mlp(norm(x))
+        else:
+            x = self.mlp(norm(x))
         return x, mem
 
 
@@ -42,7 +46,7 @@ class Model(nn.Module):
         self.lm_head = Linear(model_dim, vocab_size)
         self.embed.weight = self.lm_head.weight
         nparams = self.num_params() / 1e6
-        self.apply(self.norm_weights)
+        # self.apply(self.norm_weights)
         # print0("Number of parameters: %.3fM" % (nparams,))
         print("Number of parameters: %.3fM" % (nparams,))
 

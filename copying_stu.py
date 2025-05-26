@@ -61,11 +61,11 @@ num_epochs = 10
 vocab_size = 10 # Lowercase letters
 embed_dim = 32
 seqlen = 32
-nlayers = 10
+nlayers = 6
 
 K = 8
 num_slots = 4
-use_gating = False
+use_gating = True
 
 reverse_case = True
 device = 'cuda'

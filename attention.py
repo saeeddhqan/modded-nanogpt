@@ -5,69 +5,85 @@ from memory import memory
 nn = torch.nn
 F = nn.functional
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len=65536):
+class Rotary(torch.nn.Module):
+    def __init__(self, dim, base=10000):
         super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        # self.cos = nn.Buffer(theta.cos(), persistent=False)
-        # self.sin = nn.Buffer(theta.sin(), persistent=False)
-        self.register_buffer('cos', theta.cos(), persistent=False)
-        self.register_buffer('sin', theta.sin(), persistent=False)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
 
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, idx: int, seqlen: int, is_causal: bool, num_slots: int, use_gating: bool = False):
+    def __init__(self, dim: int, num_heads: int, idx: int, seqlen: int, is_causal: bool, num_slots: int = None, use_gating: bool = False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        self.qkv_w = nn.Parameter(torch.empty(3, dim, dim).uniform_(-bound, bound))
+        self.head_dim = dim // num_heads
+        self.c_attn = Linear(dim, dim * 3)
         self.rotary = Rotary(dim // num_heads)
         self.c_proj = Linear(dim, dim)
+        self.dim = dim
         self.use_gating = use_gating
         if use_gating:
             self.cross_attn = memory(
                 dim,
                 idx=idx,
                 block_size=seqlen,
-                num_slots=num_slots,
+                num_slots=num_slots if num_slots is not None else math.sqrt(seqlen),
                 is_causal=is_causal,
             )
             self.gate = Linear(dim, dim, bias=False)
-            self.gate.weight.detach().zero_()
             self.write_matter = nn.Parameter(torch.ones(dim) * 0.1)
-
-        with torch.no_grad():
-            nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
+            self.wsum = nn.Parameter(torch.tensor([1.0, -1.0]))
+        # with torch.no_grad():
+        #     nn.init.normal_(self.c_proj.weight, mean=0.0, std=0.02)
         self.is_causal = is_causal
 
 
     def forward(self, x: Tensor, mem: Tensor | None) -> Tensor:
         if self.use_gating:
-            h = self.gate(x)
             y, mem = self.cross_attn(x, mem)
-            x = norm(x + (F.sigmoid(h) * y) * self.write_matter).to(x.dtype)
-        B, T, C = x.size()
-        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x))
-        q, k, v = qkv.view(B, T, 3 * self.num_heads, -1).chunk(3, dim=-2)
-        q = self.rotary(q)
-        k = self.rotary(k)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1 if self.training else 0.0, is_causal=self.is_causal)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            w1, w2 = F.softmax(self.wsum, dim=0).split(1)
+            x = w1 * x + w2 * y * F.sigmoid(self.gate(x))
+        B, T, C = (
+            x.size()
+        )  # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.dim, dim=2)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        v = v.view(B, T, self.num_heads, self.head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+        )
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
+        # output projection
         y = self.c_proj(y)
         return y, mem
